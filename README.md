@@ -119,6 +119,26 @@ NG 代码：`NG_PART_NOT_FOUND`（找不到垫片）、`NG_HOLE_NOT_FOUND`（圆
 拐角角度以"工件中心 → 孔心"的向外径向方向为 0°，因此工件旋转时 4 个拐角自动跟随，
 无需知道绝对角度。换相机或换料号后用 `--calib` 重新标定。
 
+## 成像条件与标定绑定关系
+
+**相机参数是这套标定值的另一半，必须一起纳入版本管理**，记录模板见
+[`docs/camera_config.md`](docs/camera_config.md)（曝光/增益、光源极性、工作距离、
+JPEG 质量、触发、机内方案版本、机械取景，附换相机后的 7 步复检清单）。
+
+按 `r`（兜孔半径）比例写的常量换成像条件仍成立；下列常量**绑死在成像条件上**，相机一改就要重标：
+
+| 变化项 | 受影响常量 |
+|---|---|
+| 工作距离 / 分辨率 / binning | `HOLE_R_MIN/MAX_RATIO`、`HOLE_MIN_DIST_RATIO`、`OUTER_R_MIN/MAX_RATIO` |
+| 曝光 / 增益 / 光源 | `REFINE_MIN_CONTRAST`、`HOLE_HOUGH_P1/P2`、`FLANGE_HOUGH_P2`、`MARK_HOUGH_P2`、`CLAHE_CLIP` |
+| JPEG 质量 | `MARK_CIRCULARITY_MIN`、`MIN_VALID_MARKS`、`RING_MIN_CONTOUR_PTS` |
+| 取景位置 | `HOLE_CHECK_COUNT`、`MIN_HOLE_COUNT` |
+
+其中 `MARK_CIRCULARITY_MIN = 0.75` 最敏感：基准图上正面压痕圆度实测 0.78~0.89，
+**余量只有 0.03**，HTTP 接口的 JPEG 压缩率一降就可能整片掉破线。另外基准图有 20.5% 的
+像素已饱和（中心大孔过曝），成因是曝光 20 ms 叠加 Gamma 1.5，降一档亮侧翻边外圈的对比度会更好；
+360° 环光当前只开"上"一路，画面左侧偏暗，左侧兜孔的压痕检出率明显低于右上侧。
+
 ## 验证情况
 
 | 项目 | 结果 |
@@ -171,15 +191,19 @@ PLC 对接：`pip install pymodbus`，解开文件末 `ModbusReporter` 类 docst
 
 ## 建议的 .gitignore
 
-样本图片含客户零件信息，不要入库：
+样本图片含客户零件信息，不要整目录入库；但 `docs/ref/` 下的基准图是复现标定的前提，
+确认不含敏感信息后单独放开：
 
 ```gitignore
 __pycache__/
 *.pyc
+.venv/
+.idea/
 result/
 samples/
 *.jpg
 *.bmp
+!docs/ref/*.jpg      # 基准图入库，换相机/改参数时用来对比数值
 ```
 
 
