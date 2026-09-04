@@ -1016,6 +1016,7 @@ def calibrate(bgr: np.ndarray, name: str = "") -> None:
     ang = np.radians(np.arange(0.0, 360.0, REFINE_ANGLE_STEP_DEG))
     cos_t, sin_t = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
     holes = [q for q in (refine_hole(work, float(x), float(y), float(r), cos_t, sin_t)
+
                          for (x, y, r) in cand) if q is not None]
     if len(holes) < MIN_HOLE_COUNT:
         print("[CALIB] %s 精定位失败, 跳过" % name)
