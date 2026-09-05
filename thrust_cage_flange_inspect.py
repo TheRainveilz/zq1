@@ -4,8 +4,9 @@
 
 实现思路
 --------
-1) 取图层抽象：LocalFolderSource(本地遍历调试) / HttpCameraSource(WTX-3000 HTTP)，
-   由 SOURCE_MODE 一键切换，业务逻辑完全不变。
+1) 取图层抽象：LocalFolderSource(本地遍历调试) / WatchFolderSource(监视存图目录) /
+   Wtx10001Source(厂家 10001 端口私有协议真直连, 相机直接推无压缩灰度帧) /
+   HttpCameraSource(开放了 HTTP 的机型)，由 SOURCE_MODE 一键切换，业务逻辑完全不变。
 2) 工件定位(不用固定 ROI)：HoughCircles 粗找所有圆孔 -> 用孔心做最小二乘圆拟合
    (带迭代剔野点)得到"节圆"= 工件中心 + 节圆半径。工件任意旋转/偏移都自适应；
    即使外圆被相机视场切掉也能定位(现场样图正是这种半幅视野)。
@@ -29,19 +30,28 @@
 ----
     python thrust_cage_flange_inspect.py                 # 按头部常量运行
     python thrust_cage_flange_inspect.py --dir  D:\\samples
+    python thrust_cage_flange_inspect.py --mode camera   # 真直连: 等 IO 外部触发, 来一件判一件
+    python thrust_cage_flange_inspect.py --mode camera --trigger MainRunOnce   # 台上调试用软触发
     python thrust_cage_flange_inspect.py --mode http --ip 192.168.1.100
     python thrust_cage_flange_inspect.py --debug         # 输出叠加调试图
     python thrust_cage_flange_inspect.py --calib         # 拐角角度/尺寸标定(换型用)
+    python thrust_cage_flange_inspect.py --mode camera --collect "D:\\zq\\samples\\直连_正"
+                                                         # 采样: 原始帧(不划线) + PNG 无损 + OK 也存,
+                                                         #   一轮只放一类件, 之后交 dbg_report --truth
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
+import socket
+import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -51,17 +61,65 @@ import numpy as np
 # =====================================================================================
 
 # ---------- 1. 取图 / 运行模式 ----------
-SOURCE_MODE = "local"                 # "local"=本地文件夹遍历调试; "http"=WTX-3000 网络取图
+# "local" =本地文件夹遍历(离线调试)
+# "camera"=厂家 10001 端口私有协议真直连(推荐: 相机直接推实时帧, 不落盘, 请求-应答天然握手)
+# "watch" =监视存图目录(依赖 MJ_Aisensor 存图, 见下)
+# "http"  =相机 HTTP 接口(本机这台没有 Web 服务, 走不通; 保留给别的机型)
+SOURCE_MODE = "local"
 LOCAL_IMAGE_DIR = r"D:\新建文件夹\WTX3000-360C (DA7486717)"   # 样本目录(正/反面混放)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 LOCAL_RECURSIVE = True                # 递归遍历子目录
 
-CAMERA_IP = "192.168.1.100"           # WTX-3000 相机 IP
+CAMERA_IP = "169.254.44.201"          # 相机 IP(实测直连: 本机 169.254.44.200/16, 无网关)
+
+# 真直连模式 "camera": 走厂家 10001 端口私有协议, 相机把无压缩 8 位灰度帧直接推过来, 不落盘。
+# 2026-09-05 实测走通: 一帧 1280x800 = 1024000 字节, 分 788 个记录块传输; 记录格式与命令表
+# 见 Wtx10001Source 的 docstring 与 docs/camera_config.md 1.8。
+CAMERA_PORT = 10001                   # 厂家控制/数据通道(MJ_Aisensor 连的就是这个口)
+# 触发方式(上线用 "external"):
+#   "external"               = IO 外部硬触发: 上位机不发任何触发命令, 只保活 + 被动等相机推帧。
+#                              一个 IO 触发沿 = 拍一张 = 推一帧, 曝光时刻由工装/PLC 决定, 最准,
+#                              且结构上不可能"判到上一件"。
+#                              ⚠ 前提: 相机侧「触发源」要在 MJ 里设成 IO 硬触发, 且方案处于运行态;
+#                                 本模式下算法一律不发 StopRun(发了会把相机踢出运行态)。
+#   "MainRunOnce"            = 软触发(调试用): 上位机每帧发一次执行命令, 收到整帧立刻 StopRun。
+#                              ⚠ 实测发一次后相机会一直出图(≈0.8 fps)直到 StopRun, 即"连续自动跑",
+#                                 曝光时刻不受工件到位信号控制, 不适合上线。
+#   "ContinuousImageCapture" = 连续预览(≈6.25 fps): 只用来看图/调光/压亮带, 不用于判定。
+CAM_TRIGGER_ORDER = "external"
+CAM_CONNECT_TIMEOUT_S = 3.0           # 建链超时(s)
+CAM_GRAB_TIMEOUT_S = 5.0              # 软触发单帧超时(s): 超时按无效帧处理并继续, 不退出
+CAM_EXT_WAIT_S = 0.0                  # external: 等 IO 触发的超时(s)。0=一直等(上线用);
+                                      #   >0=超时按无效帧计并继续(会给 PLC 报一个 NG, 慎用)
+CAM_EXT_HINT_S = 30.0                 # external: 空等时每隔该秒数打一行"仍在等触发"; 0=不打
+CAM_HEARTBEAT_S = 1.0                 # 心跳周期(s)。实测不回心跳, 相机推 5~6 条后主动断开
+CAM_SETTLE_S = 1.0                    # 建链后先等相机把开场帧(HeartBeat/ModeState)推完
+CAM_STOP_AFTER_FRAME = True           # 仅软触发有效: 取到一帧就发 StopRun, 别让相机连续跑
+CAM_IMG_W = 1280                      # 期望帧宽(= 传感器自报 ImageResolutionWidth)
+CAM_IMG_H = 800                       # 期望帧高; 实收字节数不符时按本高度反推宽度并告警
+CAM_INTERVAL_S = 0.0                  # 仅软触发有效: 两帧之间的间隔(s); 0=判完立刻触发下一帧
+CAM_MAX_FRAMES = 0                    # 0 = 无限(上线用); >0 = 取够就退出(调试用)
+CAM_RECONNECT_TRY = 3                 # 断链后的重连次数
+
 CAMERA_URL_TEMPLATE = "http://{camera_ip}/camera/currentImage"
 HTTP_TIMEOUT_S = 2.0                  # 单帧取图超时(s)
 HTTP_INTERVAL_S = 0.20                # 连续取图间隔(s)
 HTTP_MAX_FRAMES = 0                   # 上线取 0 = 无限循环; 调试可设有限帧数
 HTTP_RETRY = 3                        # 取图失败重试次数
+HTTP_USE_SYSTEM_PROXY = False         # 本机装了系统代理(Clash 等)时必须为 False:
+                                      #   requests 默认读 Windows 系统代理设置, 会把相机 IP
+                                      #   也丢给代理(实测报 127.0.0.1:7892 ReadTimeout)
+
+# 目录监视模式 "watch": MJ_Aisensor 照常存图, 本算法盯着存图目录, 新文件一落地就判。
+# 2026-09-05 实测: 相机 80 端口拒绝连接, 没有 Web 服务, CAMERA_URL_TEMPLATE 这条路走不通;
+# 真直连已改用 "camera" 模式(10001 私有协议)。本模式保留给"必须留存图"或直连不可用的场合,
+# ⚠ 前提是 MJ 真的在存图: 实测点 3 次「执行」目录里一张新图都没多, 上线前先确认这条链是通的。
+WATCH_RECURSIVE = True                # 递归监视子目录
+WATCH_POLL_S = 0.10                   # 轮询间隔(s)
+WATCH_SETTLE_S = 0.15                 # 大小连续两次不变才算写完, 防读到只写了一半的图
+WATCH_SKIP_EXISTING = True            # True=启动时的存量图片算已处理, 只等新图; False=先跑存量
+WATCH_IDLE_TIMEOUT_S = 0.0            # 无新图超过该秒数就退出; 0=一直等(上线用)
+WATCH_MAX_FRAMES = 0                  # 0 = 无限
 
 # ---------- 2. 预处理 ----------
 RESIZE_MAX_SIDE = 0                   # >0 按最长边缩放提速; 0=原图。所有阈值均为比例量,缩放不影响判定
@@ -149,9 +207,14 @@ PRINT_DEBUG = True                    # 打印每孔轮廓计数、有效压痕�
 SAVE_NG_IMAGE = True                  # NG 样本本地保存
 SAVE_OK_IMAGE = False                 # OK 样本也保存(追溯用)
 SAVE_OVERLAY = True                   # 保存时叠加检测结果(孔/ROI/拐角/环) 便于现场看图排查
-NG_SAVE_DIR = r"D:\zq\result\NG"
-OK_SAVE_DIR = r"D:\zq\result\OK"
+                                      # ⚠ 采样标阈值时必须关掉(命令行 --no-overlay / --collect):
+                                      #   dbg_report 会去分析图上的线条, 存叠加图等于喂错数据
+NG_SAVE_DIR = r"D:\zq\result\NG"       # 命令行 --save-dir / --collect DIR 可整体改到别处
+OK_SAVE_DIR = r"D:\zq\result\OK"       #   (在 DIR 下自动建 OK/ 与 NG/ 两个子目录)
 JPEG_QUALITY = 92
+SAVE_IMAGE_EXT = ".jpg"               # 存图格式: ".jpg"=省空间(走 JPEG_QUALITY) /
+                                      #   ".png"=无损(采样标阈值用, 免得把压缩自变量又加回来)
+                                      # 命令行 --save-ext / --collect 可覆盖
 
 # ---------- 10. Modbus-TCP 对接 PLC (占位, 默认关闭) ----------
 ENABLE_MODBUS = False
@@ -322,7 +385,11 @@ class LocalFolderSource:
 
 
 class HttpCameraSource:
-    """上线取图: WTX-3000 HTTP 接口 http://{camera_ip}/camera/currentImage 。"""
+    """HTTP 取图: http://{camera_ip}/camera/currentImage 。
+
+    ⚠ 2026-09-05 现场实测: 相机 80 端口拒绝连接(WinError 10061), 本机这台没有 Web 服务,
+    本类当前无法投产, 保留给开放了 HTTP 的机型。产线请用 WatchFolderSource("watch")。
+    """
 
     def __init__(self, ip: str, max_frames: int = 0, interval_s: float = 0.2) -> None:
         self.url = CAMERA_URL_TEMPLATE.format(camera_ip=ip)
@@ -334,6 +401,11 @@ class HttpCameraSource:
             raise RuntimeError("HTTP 取图需要 requests 库: pip install requests") from exc
         self._requests = requests
         self._session = requests.Session()
+        # 相机在同一网段直连, 绝不能走系统代理: requests 默认读 Windows 代理设置,
+        # 会把 169.254.x.x 也发给本地代理端口, 表现为莫名的 ReadTimeout 而非连接失败。
+        self._session.trust_env = HTTP_USE_SYSTEM_PROXY
+        if not HTTP_USE_SYSTEM_PROXY:
+            self._session.proxies = {"http": None, "https": None}
 
     def _grab(self) -> Optional[np.ndarray]:
         for attempt in range(max(1, HTTP_RETRY)):
@@ -359,11 +431,354 @@ class HttpCameraSource:
                 time.sleep(self.interval_s)
 
 
+class WatchFolderSource:
+    """产线取图: 监视 MJ_Aisensor 的存图目录, 新图片一落地就判一次。
+
+    相机固件未开放 HTTP(实测 80 端口拒绝连接), 直连取图需实现厂家 10001 端口的私有协议;
+    本类是拿到该协议前的产线通路, 代价是多一次落盘。**只读不删**: 存图目录同时是样本库,
+    删图会毁掉标阈值要用的样本。已处理过的文件靠内存里的 seen 集合去重, 重启后按
+    WATCH_SKIP_EXISTING 决定是否重跑存量。
+    """
+
+    def __init__(self, folder: str, recursive: bool = True, max_frames: int = 0) -> None:
+        if not os.path.isdir(folder):
+            raise RuntimeError("监视目录不存在: %s" % folder)
+        self.folder = folder
+        self.recursive = recursive
+        self.max_frames = max_frames
+        self.seen = set(self._scan()) if WATCH_SKIP_EXISTING else set()
+
+    def _scan(self) -> List[str]:
+        pattern = "**/*" if self.recursive else "*"
+        out: List[str] = []
+        for path in glob.glob(os.path.join(self.folder, pattern), recursive=self.recursive):
+            if os.path.isfile(path) and os.path.splitext(path)[1].lower() in IMAGE_EXTS:
+                out.append(path)
+        return out
+
+    @staticmethod
+    def _mtime(path: str) -> float:
+        """按修改时间排序 = 按到达顺序处理(存图文件名不一定单调递增)。"""
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    @staticmethod
+    def _settled(path: str) -> bool:
+        """大小连续两次一致且非空 -> 认为已写完。防止读到只写了一半的 JPEG。"""
+        try:
+            size = os.path.getsize(path)
+            if size <= 0:
+                return False
+            time.sleep(WATCH_SETTLE_S)
+            return os.path.getsize(path) == size
+        except OSError:
+            return False
+
+    def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        n = 0
+        t_idle = time.time()
+        while self.max_frames <= 0 or n < self.max_frames:
+            fresh = [p for p in self._scan() if p not in self.seen]
+            if not fresh:
+                if 0 < WATCH_IDLE_TIMEOUT_S <= time.time() - t_idle:
+                    print("[INFO] %.1f s 无新图, 结束监视" % WATCH_IDLE_TIMEOUT_S)
+                    return
+                time.sleep(WATCH_POLL_S)
+                continue
+            fresh.sort(key=self._mtime)
+            for path in fresh:
+                if not self._settled(path):
+                    continue                                  # 还在写, 下一轮再取
+                self.seen.add(path)
+                n += 1
+                t_idle = time.time()
+                yield path, imread_unicode(path)
+                if 0 < self.max_frames <= n:
+                    return
+
+
+class Wtx10001Source:
+    """真直连取图: 厂家 10001 端口私有协议(相机自报 Model VN2000, WTX-3000-360C 是贴牌名)。
+
+    2026-09-05 抓包 + 实测确认, 链路上每条记录都是同一个结构:
+
+        +0   AA 55 AB CD             魔数
+        +7   u16 小端 载荷长度        <- 唯一可靠的长度字段(偏移 4 的大端值在图像块上恒为 20)
+        +9   0x01=控制帧(JSON), 0x14=图像数据块
+        +10  0x00=控制帧, 0x03=图像块
+        +13  u16 小端 图像块序号 0..N
+        +17  u16 小端 随图结果 JSON 的长度
+        +50  载荷
+        尾   2 字节 = (sum(头 50 字节) + sum(载荷)) & 0xFF, 再跟一个 0x00
+
+    一帧图 = 788 个图像块: 块 0 的载荷 = 结果 JSON + 像素, 其余块全是像素, 末块比常规块短;
+    像素合计 1024000 字节 = 1280 x 800 无压缩 8 位灰度, 与传感器自报 ImageResolution 一致
+    (标定样本是 1216 x 1024 的 JPEG, 两者取景不同, 换基准图时注意)。
+
+    两条实测约定:
+      - 连上后必须约 1 s 回一条 HeartBeat, 否则相机推 5~6 条心跳就主动断开;
+      - 触发分两种(CAM_TRIGGER_ORDER):
+          external    IO 外部硬触发(上线用): 只保活, 被动等相机推帧。曝光时刻由工装/PLC 的
+                      到位信号决定, 一个触发沿一帧, 结构上不可能判到上一件; 本模式下不发
+                      StopRun(那会把相机踢出运行态), 也不在两帧之间清积压(否则会丢件)。
+          MainRunOnce 软触发(调试用): 清积压 -> 发命令 -> 收第一整帧 -> 发 StopRun。
+                      ⚠ 相机收到一次 MainRunOnce 会一直出图(≈0.8 fps)直到 StopRun, 即连续自动跑,
+                      拍照时刻与工件到位无关, 只适合台上调试。
+    """
+
+    MAGIC = b"\xaa\x55\xab\xcd"
+    HDR = 50
+    TRAILER = 2
+
+    def __init__(self, ip: str, port: int = CAMERA_PORT, max_frames: int = 0) -> None:
+        self.addr = (ip, port)
+        self.max_frames = max_frames
+        self._sock: Optional[socket.socket] = None
+        self._buf = bytearray()                               # 尚未切出完整记录的残留字节
+        self._pix = bytearray()                               # 当前帧已收到的像素
+        self._chunk_n = 0                                     # 常规块载荷长度, 收到更短的块=帧尾
+        self._meta: Dict[str, object] = {}                    # 随帧的结果 JSON(取 ImageName 做帧名)
+        self._send_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._open()
+
+    # ---------- 帧封装 ----------
+    @classmethod
+    def _pack(cls, payload: bytes) -> bytes:
+        head = bytearray(cls.HDR)
+        head[0:4] = cls.MAGIC
+        struct.pack_into("<H", head, 7, len(payload))         # 载荷长度
+        head[9] = 0x01                                        # 控制帧
+        struct.pack_into("<H", head, 17, len(payload))        # 控制帧上该字段 = 载荷长度
+        return bytes(head) + payload + bytes(((sum(head) + sum(payload)) & 0xFF, 0))
+
+    @classmethod
+    def _order(cls, name: str, **extra: object) -> bytes:
+        obj: Dict[str, object] = {"CommuniInfo": {"PortCode": "Smsocket3"}, "Order": name}
+        obj.update(extra)
+        return cls._pack(json.dumps(obj, separators=(",", ":")).encode())
+
+    @classmethod
+    def _is_external(cls) -> bool:
+        """True = IO 外部硬触发: 上位机只保活, 不发触发命令、不发 StopRun、不清积压。"""
+        return str(CAM_TRIGGER_ORDER).strip().lower() in ("", "external", "io", "hard", "none")
+
+    @classmethod
+    def _trigger_frame(cls) -> bytes:
+        if CAM_TRIGGER_ORDER == "ContinuousImageCapture":
+            return cls._order(CAM_TRIGGER_ORDER, ContinuousImageCapture="ImageCapture")
+        return cls._order(CAM_TRIGGER_ORDER)
+
+    # ---------- 连接 ----------
+    def _open(self) -> None:
+        sock = socket.socket()
+        sock.settimeout(CAM_CONNECT_TIMEOUT_S)
+        sock.connect(self.addr)
+        sock.settimeout(0.5)
+        self._sock = sock
+        self._stop.clear()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+        time.sleep(CAM_SETTLE_S)                              # 让相机把开场帧推完再干活
+        self._drain()
+
+    def _reopen(self) -> bool:
+        self.close()
+        for k in range(max(1, CAM_RECONNECT_TRY)):
+            time.sleep(0.5)
+            try:
+                self._open()
+                print("[INFO] 已重连相机 %s:%d" % self.addr)
+                return True
+            except OSError as exc:
+                print("[WARN] 第 %d 次重连失败: %s" % (k + 1, exc))
+        return False
+
+    def _send(self, data: bytes) -> None:
+        with self._send_lock:
+            if self._sock is None:
+                raise OSError("连接已关闭")
+            self._sock.sendall(data)
+
+    def _heartbeat(self) -> None:
+        """实测: 不回心跳相机就单方面断开, 所以必须有这条 1 s 的保活线程。"""
+        while not self._stop.wait(CAM_HEARTBEAT_S):
+            try:
+                self._send(self._order("HeartBeat"))
+            except OSError:
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        sock, self._sock = self._sock, None
+        self._buf.clear()
+        if sock is None:
+            return
+        if not self._is_external():                           # IO 硬触发下发 StopRun 会把相机
+            try:                                              #   踢出运行态, 下一件就不拍了
+                sock.sendall(self._order("StopRun"))          # 软触发: 别把相机留在连续出图状态
+            except OSError:
+                pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    # ---------- 收帧 ----------
+    def _drain(self) -> None:
+        """清掉触发前积压的数据, 保证判的是本次触发的新帧(防判到上一件)。"""
+        sock = self._sock
+        if sock is None:
+            return
+        sock.settimeout(0.05)
+        t0 = time.time()
+        try:
+            while time.time() - t0 < 0.5 and sock.recv(1 << 18):
+                pass
+        except OSError:
+            pass
+        finally:
+            sock.settimeout(0.5)
+        self._buf.clear()
+        self._pix, self._chunk_n, self._meta = bytearray(), 0, {}
+
+    def _records(self) -> Iterator[Tuple[int, int, int, bytes]]:
+        """从缓冲里切出所有完整记录: (类型字节, 块序号, 结果 JSON 长度, 载荷)。"""
+        buf = self._buf
+        while len(buf) >= self.HDR:
+            if buf[0:4] != self.MAGIC:
+                del buf[0:1]                                  # 极少见: 流头对不齐时逐字节重同步
+                continue
+            n = struct.unpack_from("<H", buf, 7)[0]
+            if len(buf) < self.HDR + n + self.TRAILER:
+                return                                        # 记录没收全, 等下一次 recv
+            rec = (buf[10], struct.unpack_from("<H", buf, 13)[0],
+                   struct.unpack_from("<H", buf, 17)[0], bytes(buf[self.HDR:self.HDR + n]))
+            del buf[0:self.HDR + n + self.TRAILER]
+            yield rec
+
+    def _feed(self, kind: int, seq: int, njson: int, pay: bytes) -> Optional[bytes]:
+        """喂一条记录进帧缓冲, 攒满一整帧就返回像素字节, 否则 None。"""
+        if kind != 0x03:                                      # 控制帧(心跳/Reply/状态), 取图不用
+            return None
+        if seq == 0:                                          # 新帧起点: 载荷 = 结果 JSON + 像素
+            self._chunk_n = len(pay)
+            try:
+                self._meta = json.loads(pay[:njson].decode("utf-8", "replace"))
+            except ValueError:
+                self._meta = {}
+            self._pix = bytearray(pay[njson:])
+        elif self._chunk_n:
+            self._pix += pay
+        else:
+            return None                                       # 半截帧(连上瞬间正在传的那一帧), 丢掉
+        if len(pay) >= self._chunk_n and len(self._pix) < CAM_IMG_W * CAM_IMG_H:
+            return None                                       # 末块必然短于常规块
+        out = bytes(self._pix)
+        self._pix, self._chunk_n = bytearray(), 0
+        return out
+
+    def _wait_frame(self, timeout_s: float) -> Optional[bytes]:
+        """收字节直到攒满一整帧。timeout_s<=0 = 一直等(IO 触发的间隔由产线决定)。
+
+        返回像素字节; 超时返回 None; 对端关闭抛 OSError。
+        """
+        t0 = t_hint = time.time()
+        while timeout_s <= 0 or time.time() - t0 < timeout_s:
+            try:
+                chunk = self._sock.recv(1 << 18)              # type: ignore[union-attr]
+            except socket.timeout:
+                if CAM_EXT_HINT_S > 0 and time.time() - t_hint >= CAM_EXT_HINT_S:
+                    t_hint = time.time()
+                    print("[INFO] 等触发信号中... 已等 %.0f s (链路正常, 心跳在回)"
+                          % (time.time() - t0))
+                continue
+            if not chunk:
+                raise OSError("相机关闭了连接")
+            self._buf += chunk
+            for rec in self._records():
+                pix = self._feed(*rec)
+                if pix is not None:
+                    return pix
+        return None
+
+    def _grab(self) -> Optional[bytes]:
+        """取一帧。IO 硬触发=被动等; 软触发=清积压->发命令->收整帧->StopRun。"""
+        if self._is_external():
+            return self._wait_frame(CAM_EXT_WAIT_S)           # 不发命令, 也不清积压(会丢件)
+        self._drain()                                         # 软触发: 扔掉积压, 保证判本次的新帧
+        self._send(self._trigger_frame())
+        pix = self._wait_frame(CAM_GRAB_TIMEOUT_S)
+        if pix is not None and CAM_STOP_AFTER_FRAME:
+            self._send(self._order("StopRun"))
+        return pix
+
+    @staticmethod
+    def _to_bgr(pix: bytes) -> Optional[np.ndarray]:
+        """无压缩 8 位灰度 -> 3 通道 BGR, 与其它取图源一致, 业务逻辑无需区分来源。"""
+        w, h = CAM_IMG_W, CAM_IMG_H
+        if len(pix) != w * h:                                 # 相机改了分辨率/ROI
+            if h > 0 and len(pix) % h == 0:
+                w = len(pix) // h
+                print("[WARN] 实收 %d 字节 != %d x %d, 按 %d x %d 解开(请核对 CAM_IMG_W/H)"
+                      % (len(pix), CAM_IMG_W, CAM_IMG_H, w, h))
+            else:
+                print("[WARN] 实收 %d 字节按高 %d 除不尽, 丢弃本帧" % (len(pix), h))
+                return None
+        gray = np.frombuffer(pix, dtype=np.uint8).reshape(h, w)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        n = 0
+        while self.max_frames <= 0 or n < self.max_frames:
+            n += 1
+            name, bgr = "CAM#%06d" % n, None
+            try:
+                pix = self._grab()
+                if pix is None:
+                    if self._is_external():
+                        print("[WARN] %.1f s 内没等到 IO 触发帧(相机触发源是否已设为 IO? "
+                              "方案是否在运行态?)" % CAM_EXT_WAIT_S)
+                    else:
+                        print("[WARN] %.1f s 内没收到整帧(触发命令 %s 无响应?)"
+                              % (CAM_GRAB_TIMEOUT_S, CAM_TRIGGER_ORDER))
+                else:
+                    bgr = self._to_bgr(pix)
+                    stamp = str(self._meta.get("ImageName") or "")
+                    if stamp:
+                        name = "CAM_%s" % stamp               # 相机侧时间戳, 便于对帐
+            except OSError as exc:                            # noqa: BLE001
+                print("[WARN] 直连中断(%s), 重连中..." % exc)
+                if not self._reopen():
+                    print("[FATAL] 重连失败, 结束取图")
+                    return
+            yield name, bgr
+            if CAM_INTERVAL_S > 0 and not self._is_external():
+                time.sleep(CAM_INTERVAL_S)                    # IO 触发下不能睡, 睡会积压/丢件
+
+
 def build_source(mode: str, folder: str, ip: str):
     """一键切换取图方式。"""
+    if mode == "camera":
+        src = Wtx10001Source(ip, CAMERA_PORT, CAM_MAX_FRAMES)
+        how = ("IO 外部硬触发(被动等相机推帧, 不发触发命令/StopRun)"
+               if Wtx10001Source._is_external() else "软触发 %s" % CAM_TRIGGER_ORDER)
+        print("[INFO] 取图模式: CAMERA 直连 %s:%d  触发=%s  期望 %d x %d 灰度"
+              % (ip, CAMERA_PORT, how, CAM_IMG_W, CAM_IMG_H))
+        if Wtx10001Source._is_external():
+            print("[INFO] 已连上并保活, 等工件到位的 IO 触发信号...  "
+                  "(相机侧「触发源」须为 IO 硬触发且方案在运行态; Ctrl-C 停机)")
+        return src
     if mode == "http":
         print("[INFO] 取图模式: HTTP  %s" % CAMERA_URL_TEMPLATE.format(camera_ip=ip))
         return HttpCameraSource(ip, HTTP_MAX_FRAMES, HTTP_INTERVAL_S)
+    if mode == "watch":
+        src = WatchFolderSource(folder, WATCH_RECURSIVE, WATCH_MAX_FRAMES)
+        print("[INFO] 取图模式: WATCH  %s" % folder)
+        print("[INFO] 存量 %d 张(%s), 等新图中... Ctrl-C 停止"
+              % (len(src.seen), "跳过" if WATCH_SKIP_EXISTING else "不跳过"))
+        return src
     src = LocalFolderSource(folder, LOCAL_RECURSIVE)
     print("[INFO] 取图模式: LOCAL  %s  (%d 张)" % (folder, len(src)))
     return src
@@ -946,7 +1361,7 @@ def save_result_image(bgr: np.ndarray, res: InspectResult, overlay: bool) -> Opt
     folder = OK_SAVE_DIR if res.is_ok else NG_SAVE_DIR
     base = os.path.splitext(os.path.basename(res.name))[0] or "frame"
     base = "".join(ch if ch.isalnum() or ch in "-_#" else "_" for ch in base)[:60]
-    fname = "%s_%s_%s.jpg" % (time.strftime("%Y%m%d_%H%M%S"), base, res.verdict)
+    fname = "%s_%s_%s%s" % (time.strftime("%Y%m%d_%H%M%S"), base, res.verdict, SAVE_IMAGE_EXT)
     path = os.path.join(folder, fname)
     img = draw_overlay(bgr, res) if (overlay and SAVE_OVERLAY) else bgr
     return path if imwrite_unicode(path, img) else None
@@ -1100,11 +1515,28 @@ def guess_label(name: str) -> Optional[bool]:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="推力保持架垫片 冲压翻边正/反面检测")
-    ap.add_argument("--mode", choices=("local", "http"), default=SOURCE_MODE, help="取图方式")
-    ap.add_argument("--dir", default=LOCAL_IMAGE_DIR, help="本地样本目录")
-    ap.add_argument("--ip", default=CAMERA_IP, help="WTX-3000 相机 IP")
+    ap.add_argument("--mode", choices=("local", "camera", "watch", "http"), default=SOURCE_MODE,
+                    help="取图方式: local=遍历目录, camera=10001 私有协议真直连(产线推荐), "
+                         "watch=监视存图目录, http=相机 HTTP 接口(本机这台无 Web 服务)")
+    ap.add_argument("--dir", default=LOCAL_IMAGE_DIR, help="本地样本目录 / watch 的监视目录")
+    ap.add_argument("--ip", default=CAMERA_IP, help="相机 IP")
+    ap.add_argument("--trigger", choices=("external", "MainRunOnce", "ContinuousImageCapture"),
+                    default=CAM_TRIGGER_ORDER,
+                    help="camera 模式的触发方式: external=IO 外部硬触发(上线, 被动等帧), "
+                         "MainRunOnce=软触发(台上调试), ContinuousImageCapture=连续预览(调光)")
     ap.add_argument("--debug", action="store_true", help="额外保存叠加调试图(OK 也存)")
     ap.add_argument("--calib", action="store_true", help="拐角角度/尺寸标定模式(换型用)")
+    ap.add_argument("--collect", metavar="DIR", default=None,
+                    help="采样模式(标阈值/重标定用): 等价于 --save-dir DIR --no-overlay "
+                         "--save-ext .png 且 OK 帧也存。⚠ 一轮只放一类件(正/反/边界), "
+                         "跑完交给 dbg_report --dir DIR --truth front|back")
+    ap.add_argument("--save-dir", dest="save_dir", metavar="DIR", default=None,
+                    help="存图根目录, 在它下面自动建 OK/ 与 NG/ 两个子目录"
+                         "(不给则用头部 OK_SAVE_DIR / NG_SAVE_DIR)")
+    ap.add_argument("--no-overlay", dest="no_overlay", action="store_true",
+                    help="存图不划线, 只存原始帧。喂 dbg_report 必须这样, 否则它会去分析图上的线条")
+    ap.add_argument("--save-ext", dest="save_ext", choices=(".jpg", ".png"), default=None,
+                    help="存图格式: .jpg=省空间(走 JPEG_QUALITY), .png=无损(采样用)")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张(本地调试用)")
     ap.add_argument("--holes", type=int, default=None,
                     help="覆盖 HOLE_CHECK_COUNT: 参与判定的孔数, 0=全部孔(排查用)")
@@ -1114,11 +1546,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_console()
     args = parse_args(argv)
-    global SAVE_OK_IMAGE, HOLE_CHECK_COUNT
+    global SAVE_OK_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
+    global SAVE_OVERLAY, SAVE_IMAGE_EXT, OK_SAVE_DIR, NG_SAVE_DIR
     if args.debug:
         SAVE_OK_IMAGE = True
     if args.holes is not None:
         HOLE_CHECK_COUNT = args.holes
+    CAM_TRIGGER_ORDER = args.trigger
+    if args.limit > 0:
+        CAM_MAX_FRAMES = args.limit                           # 取够就收工: IO 触发下若只在主循环里
+                                                              #   判上限, 会卡在等下一个上升沿才退出
+    if args.collect:                                          # 采样模式: 原始帧 + 无损 + OK 也存
+        SAVE_OK_IMAGE = True
+        SAVE_OVERLAY = False
+        SAVE_IMAGE_EXT = ".png"
+    if args.no_overlay:                                       # 单独用也行, 与 --collect 不冲突
+        SAVE_OVERLAY = False
+    if args.save_ext:
+        SAVE_IMAGE_EXT = args.save_ext
+    save_root = args.collect or args.save_dir                 # 换轮次只改这一个路径, 不用动头部常量
+    if save_root:
+        OK_SAVE_DIR = os.path.join(save_root, "OK")
+        NG_SAVE_DIR = os.path.join(save_root, "NG")
+    if args.collect or args.no_overlay or args.save_ext or save_root:
+        where = (os.path.join(os.path.abspath(save_root), "{OK,NG}") if save_root
+                 else "%s + %s" % (OK_SAVE_DIR, NG_SAVE_DIR))
+        print("[INFO] 存图 %s | 格式 %s | %s"
+              % (where, SAVE_IMAGE_EXT,
+                 "叠加检测结果" if SAVE_OVERLAY else "只存原始帧(可直接喂 dbg_report)"))
+    if args.collect:
+        print("[INFO] 采样模式: 本轮只放一类件(正/反/边界)。跑完执行:")
+        print('       python dbg_report.py --dir "%s" --holes 0 --sweep --truth front|back'
+              % os.path.abspath(args.collect))
     try:
         source = build_source(args.mode, args.dir, args.ip)
     except Exception as exc:                                  # noqa: BLE001
@@ -1132,30 +1591,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_ok = n_ng = n_bad = 0
     hit = miss = 0
     t_start = time.time()
-    for idx, (name, bgr) in enumerate(source.frames()):
-        if args.limit and idx >= args.limit:
-            break
-        if bgr is None:
-            n_bad += 1
-            print("[WARN] 帧无效, 按 NG 处理: %s" % name)
-            plc.report(False)
-            continue
-        if args.calib:
-            calibrate(bgr, name)
-            continue
-        res, proc = inspect(bgr, name)
-        if PRINT_DEBUG:
-            print_result(res)
-        saved = save_result_image(proc, res, overlay=True)
-        if saved:
-            print("  存图: %s" % saved)
-        plc.report(res.is_ok)
-        n_ok += res.is_ok
-        n_ng += (not res.is_ok)
-        truth = guess_label(name)
-        if truth is not None:
-            hit += (truth == res.is_ok)
-            miss += (truth != res.is_ok)
+    try:
+        for idx, (name, bgr) in enumerate(source.frames()):
+            if args.limit and idx >= args.limit:
+                break
+            if bgr is None:
+                n_bad += 1
+                print("[WARN] 帧无效, 按 NG 处理: %s" % name)
+                plc.report(False)
+                continue
+            if args.calib:
+                calibrate(bgr, name)
+                continue
+            res, proc = inspect(bgr, name)
+            if PRINT_DEBUG:
+                print_result(res)
+            saved = save_result_image(proc, res, overlay=True)
+            if saved:
+                print("  存图: %s" % saved)
+            plc.report(res.is_ok)
+            n_ok += res.is_ok
+            n_ng += (not res.is_ok)
+            truth = guess_label(name)
+            if truth is not None:
+                hit += (truth == res.is_ok)
+                miss += (truth != res.is_ok)
+    except KeyboardInterrupt:                                 # camera/watch/http 的正常停机方式
+        print("\n[INFO] 已中断, 下面是本次汇总")
+    getattr(source, "close", lambda: None)()                  # 直连: 断开(软触发时顺带发 StopRun)
     plc.close()
     if not args.calib:
         total = n_ok + n_ng
